@@ -210,6 +210,46 @@ export function withOwnerLines(content: string, owner: string, lines: string[]):
 
 // ─── Git ──────────────────────────────────────────────────────
 
+/**
+ * Characters of pathspec one `git` command may carry. Windows caps the whole
+ * CreateProcess command line at 32,767 characters, so a delivery that names
+ * more paths than that never reached git at all: `spawn ENAMETOOLONG`, which
+ * doctor reported as "git could not say what <root> tracks or ignores" (#1977).
+ * The margin leaves room for the subcommand, its flags, and the quoting Node
+ * adds around each argument.
+ */
+const PATHSPEC_ARGV_BUDGET = 24_000;
+
+/**
+ * `rels` batched so one batch's argv stays inside `budget`. Batches keep
+ * `rels`'s order, and a `rel` longer than the budget gets a batch of its own
+ * rather than being dropped. No `rels` stays one empty batch, so the caller's
+ * command still means "every path", exactly as before.
+ */
+export function batchPathspecs(rels: string[], budget: number = PATHSPEC_ARGV_BUDGET): string[][] {
+  const batches: string[][] = [];
+  let batch: string[] = [];
+  let carried = 0;
+
+  for (const rel of rels) {
+    // +1 for the separator a command line puts between two arguments.
+    const cost = rel.length + 1;
+
+    if (batch.length > 0 && carried + cost > budget) {
+      batches.push(batch);
+      batch = [];
+      carried = 0;
+    }
+
+    batch.push(rel);
+    carried += cost;
+  }
+
+  batches.push(batch);
+
+  return batches;
+}
+
 /** Git, run where `cwd` is, never where a hook's exported GIT_DIR points (#915). */
 function runGit(args: string[], cwd: string): Promise<ExecResult> {
   return execCommand('git', args, { cwd, timeoutMs: 10_000, env: withoutGitRepositoryEnv() })
@@ -719,10 +759,17 @@ export class GitContext {
 
     if (!found) {
       const scope = kind === 'tracked' ? ['--'] : ['--others', '--exclude-standard', '--'];
-      found = runGit(['--literal-pathspecs', 'ls-files', '-z', ...scope, ...rels], root).then((listed) => {
-        if (listed.code !== 0) listing.delete(key);
+      found = Promise.all(batchPathspecs(rels).map((batch) => runGit(['--literal-pathspecs', 'ls-files', '-z', ...scope, ...batch], root))).then((listed) => {
+        const failed = listed.find((one) => one.code !== 0);
 
-        return listed;
+        if (failed) {
+          listing.delete(key);
+
+          return failed;
+        }
+
+        // `-z` terminates every name it prints, so one batch's stdout follows another's.
+        return { code: 0, stdout: listed.map((one) => one.stdout).join(''), stderr: listed.map((one) => one.stderr).join('') };
       });
       listing.set(key, found);
     }
